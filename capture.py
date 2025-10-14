@@ -8,9 +8,11 @@ from ultralytics import YOLO
 
 # ---------- CONFIG ----------
 CSV_FILE = "shoulder_data.csv"
-FIXATION_WINDOW = 15          # frames for fixation computation
-FIXATION_THRESHOLD = 3.0      # threshold (degrees)
+WINDOW_SIZE = 30
+STEP_SIZE = 10
 YOLO_MODEL = "yolov8n.pt"
+FIXATION_WINDOW = 15
+FIXATION_THRESHOLD = 3.0
 
 # ---------- INIT ----------
 mp_face_mesh = mp.solutions.face_mesh
@@ -18,13 +20,26 @@ face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refi
 model = YOLO(YOLO_MODEL)
 cap = cv2.VideoCapture(0)
 
-# current label mode
-current_label = "safe"
+current_mode = "safe"  # "safe" → intentional, "attack" → non-intentional
+frame_buffer = deque(maxlen=WINDOW_SIZE)
+frame_count = 0
+face_histories = {}
 
-# CSV header
+# ---------- CSV HEADER ----------
 with open(CSV_FILE, mode='w', newline='') as f:
     writer = csv.writer(f)
-    writer.writerow(["timestamp", "face_id", "yaw", "pitch", "distance", "fixation_percent", "label"])
+    writer.writerow([
+        "timestamp", "face_id",
+        # landmark raw positions (averaged per window)
+        "left_eye_x", "left_eye_y", "left_eye_z",
+        "right_eye_x", "right_eye_y", "right_eye_z",
+        "nose_x", "nose_y", "nose_z",
+        # motion and fixation stats
+        "yaw_mean", "pitch_mean", "distance_mean", "fixation_mean",
+        "yaw_std", "pitch_std", "distance_std", "fixation_std",
+        "vel_mean", "vel_std", "acc_mean", "acc_std", "smoothness",
+        "label"
+    ])
 
 # ---------- HELPERS ----------
 def compute_gaze_angles(eye_center, nose_tip):
@@ -48,15 +63,20 @@ def compute_fixation_percentage(history):
     fixation_percent = np.clip((1 - (yaw_std + pitch_std) / (2 * FIXATION_THRESHOLD)) * 100, 0, 100)
     return fixation_percent if stable else fixation_percent / 2
 
-# ---------- CONSTANTS ----------
+def compute_temporal_dynamics(yaw_pitch_series):
+    yaws, pitches = np.array(yaw_pitch_series).T
+    vel = np.sqrt(np.diff(yaws)**2 + np.diff(pitches)**2)
+    acc = np.diff(vel)
+    vel_mean, vel_std = np.mean(vel), np.std(vel)
+    acc_mean, acc_std = np.mean(acc), np.std(acc)
+    smoothness = 1 / (vel_std + 1e-6)
+    return vel_mean, vel_std, acc_mean, acc_std, smoothness
+
 LEFT_EYE_IDX = [33, 133, 159, 145]
 RIGHT_EYE_IDX = [362, 263, 386, 374]
 NOSE_TIP_IDX = 1
 
-# track gaze history
-face_histories = {}
-
-print("Press 'S' for SAFE mode, 'A' for ATTACK mode, 'Q' to quit")
+# ---------- MAIN LOOP ----------
 
 while True:
     ret, frame = cap.read()
@@ -73,6 +93,7 @@ while True:
     faces.sort(key=lambda f: f[0], reverse=True)
 
     if len(faces) > 1:
+        # Ignore largest (user) face
         for face_id, (_, (x1, y1, x2, y2)) in enumerate(faces[1:], start=1):
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
@@ -88,7 +109,7 @@ while True:
 
                     left_eye = eye_center(lm, LEFT_EYE_IDX)
                     right_eye = eye_center(lm, RIGHT_EYE_IDX)
-                    nose_tip = lm[NOSE_TIP_IDX]
+                    nose_tip = np.array(lm[NOSE_TIP_IDX])
 
                     yaw_l, pitch_l = compute_gaze_angles(left_eye, nose_tip)
                     yaw_r, pitch_r = compute_gaze_angles(right_eye, nose_tip)
@@ -105,34 +126,54 @@ while True:
                     face_histories[face_id].append((yaw_avg, pitch_avg))
                     fixation_percent = compute_fixation_percentage(face_histories[face_id])
 
-                    with open(CSV_FILE, mode='a', newline='') as f:
-                        writer = csv.writer(f)
-                        writer.writerow([
-                            time.time(), face_id, yaw_avg, pitch_avg, distance_metric, fixation_percent, current_label
-                        ])
+                    # Add frame data to window
+                    frame_buffer.append([
+                        yaw_avg, pitch_avg, distance_metric, fixation_percent,
+                        *left_eye, *right_eye, *nose_tip
+                    ])
+                    frame_count += 1
+
+                    if len(frame_buffer) == WINDOW_SIZE and frame_count % STEP_SIZE == 0:
+                        arr = np.array(frame_buffer)
+                        mean_vals = np.mean(arr[:, :4], axis=0)
+                        std_vals = np.std(arr[:, :4], axis=0)
+                        vel_mean, vel_std, acc_mean, acc_std, smoothness = compute_temporal_dynamics(arr[:, :2])
+
+                        # Average 3D points
+                        left_mean = np.mean(arr[:, 4:7], axis=0)
+                        right_mean = np.mean(arr[:, 7:10], axis=0)
+                        nose_mean = np.mean(arr[:, 10:13], axis=0)
+
+                        label = "intentional" if current_mode == "safe" else "non-intentional"
+
+                        with open(CSV_FILE, mode='a', newline='') as f:
+                            writer = csv.writer(f)
+                            writer.writerow([
+                                time.time(), face_id,
+                                *left_mean, *right_mean, *nose_mean,
+                                *mean_vals, *std_vals,
+                                vel_mean, vel_std, acc_mean, acc_std, smoothness,
+                                label
+                            ])
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                    cv2.putText(frame, f"{current_label.upper()}",
-                                (x1, y1 - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 
-                                (0, 255, 0) if current_label=="safe" else (0, 0, 255), 2)
+                    cv2.putText(frame, f"{current_mode.upper()}",
+                                (x1, y1 - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (0, 255, 0) if current_mode == "safe" else (0, 0, 255), 2)
                     cv2.putText(frame, f"Fix:{fixation_percent:.0f}% Dist:{distance_metric:.2f}",
                                 (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-    else:
-        cv2.putText(frame, "Only one face detected (user)", (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    cv2.putText(frame, f"Mode: {current_mode.upper()} ({'Intentional' if current_mode=='safe' else 'Non-intentional'})",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 255, 0) if current_mode == "safe" else (0, 0, 255), 2)
 
-    cv2.putText(frame, f"Mode: {current_label.upper()}", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, 
-                (0, 255, 0) if current_label == "safe" else (0, 0, 255), 2)
-
-    cv2.imshow("Shoulder Surfing Data Collector", frame)
+    cv2.imshow("Intent Window Collector", frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('s'):
-        current_label = "safe"
+        current_mode = "safe"
     elif key == ord('a'):
-        current_label = "attack"
+        current_mode = "attack"
     elif key == ord('q'):
         break
 
