@@ -8,10 +8,10 @@ from ultralytics import YOLO
 
 # ---------- CONFIG ----------
 CSV_FILE = "shoulder_data.csv"
-WINDOW_SIZE = 30
+WINDOW_SIZE = 15
 STEP_SIZE = 10
 YOLO_MODEL = "yolov8n.pt"
-FIXATION_WINDOW = 15
+FIXATION_WINDOW = 5
 FIXATION_THRESHOLD = 3.0
 
 # ---------- INIT ----------
@@ -26,7 +26,7 @@ frame_count = 0
 face_histories = {}
 
 # ---------- CSV HEADER ----------
-with open(CSV_FILE, mode='w', newline='') as f:
+with open(CSV_FILE, mode='a', newline='') as f:
     writer = csv.writer(f)
     writer.writerow([
         "timestamp", "face_id",
